@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 
 	"github.com/xmdhs/clash2sfa/model"
 	"github.com/xmdhs/clash2singbox/convert"
@@ -277,8 +278,7 @@ func detourChain[T any](start string, nodes map[string]T, tagAndDetour func(T) (
 func chainSingCopies(chain []singbox.SingBoxOut, nodeTag, group string) []singbox.SingBoxOut {
 	copies := make([]singbox.SingBoxOut, 0, len(chain))
 	detour := nodeTag
-	for i := len(chain) - 1; i >= 0; i-- {
-		c := chain[i]
+	for i, c := range slices.Backward(chain) {
 		c.Detour = detour
 		c.Tag = chainTag(nodeTag, c.Tag, group)
 		c.Visible = chainVisible(i, group)
@@ -293,8 +293,8 @@ func chainAnyCopies(chain []map[string]any, nodeTag, group string) ([]map[string
 	copies := make([]map[string]any, 0, len(chain))
 	tags := make([]TagWithVisible, 0, len(chain))
 	detour := nodeTag
-	for i := len(chain) - 1; i >= 0; i-- {
-		c := maps.Clone(chain[i])
+	for i, c := range slices.Backward(chain) {
+		c := maps.Clone(c)
 		origTag, _ := c["tag"].(string)
 		newTag := chainTag(nodeTag, origTag, group)
 		c["detour"] = detour

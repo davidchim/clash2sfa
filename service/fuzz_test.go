@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// FuzzGetExtTag 任意配置字节解析都不应 panic。
-func FuzzGetExtTag(f *testing.F) {
+// FuzzTemplateOutbounds 任意配置字节解析都不应 panic。
+func FuzzTemplateOutbounds(f *testing.F) {
 	seeds := []string{
 		`{"outbounds":[{"type":"vmess","tag":"a"},{"type":"direct","tag":"direct"}]}`,
 		`{}`,
@@ -18,7 +18,11 @@ func FuzzGetExtTag(f *testing.F) {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		_, _ = getExtTag(data)
+		config, err := decodeConfig(data)
+		if err != nil {
+			return
+		}
+		_, _ = templateOutbounds(config)
 	})
 }
 

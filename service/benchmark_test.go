@@ -24,20 +24,7 @@ func benchmarkSfaTemplateJSON(nodeCount int) []byte {
 	return b.Bytes()
 }
 
-func BenchmarkGetExtTag(b *testing.B) {
-	config := benchmarkSfaTemplateJSON(1000)
-	b.ReportAllocs()
-	b.SetBytes(int64(len(config)))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := getExtTag(config)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkGetExtTagFromMap(b *testing.B) {
+func BenchmarkTemplateOutbounds(b *testing.B) {
 	config := benchmarkSfaTemplateJSON(1000)
 	decoded, err := decodeConfig(config)
 	if err != nil {
@@ -47,7 +34,7 @@ func BenchmarkGetExtTagFromMap(b *testing.B) {
 	b.SetBytes(int64(len(config)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := getExtTagFromMap(decoded)
+		_, err := templateOutbounds(decoded)
 		if err != nil {
 			b.Fatal(err)
 		}

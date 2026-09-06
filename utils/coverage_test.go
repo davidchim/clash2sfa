@@ -24,9 +24,13 @@ func TestAnyGetTypeMismatch(t *testing.T) {
 	assert.Equal(t, "", v2)
 }
 
-func TestAnySetNonMapDefault(t *testing.T) {
-	// 指针指向非 map 类型时返回 true
-	assert.True(t, AnySet(&struct{}{}, "x", "tag"))
+func TestAnySetNonMapPointer(t *testing.T) {
+	// 指针指向非 map 类型时无处可写，返回 false
+	assert.False(t, AnySet(&struct{}{}, "x", "tag"))
+	// 指向指针的指针不再支持
+	m := map[string]any{}
+	pm := &m
+	assert.False(t, AnySet(&pm, "x", "tag"))
 }
 
 func TestGetSingBoxVersionSemverError(t *testing.T) {

@@ -1,95 +1,51 @@
 package utils
 
-import "reflect"
-
+// AnyGet 从 map[string]any（或指向它的指针、指向它的 *any）中读取字段 f 并断言为 K；任何一步失败都返回零值。
 func AnyGet[K any](d any, f string) K {
 	var zero K
-	var m map[string]any
-
-	switch v := d.(type) {
-	case map[string]any:
-		m = v
-	case *map[string]any:
-		if v == nil {
-			return zero
-		}
-		m = *v
-	case *any:
-		if v == nil {
-			return zero
-		}
-		var ok bool
-		m, ok = (*v).(map[string]any)
-		if !ok {
-			return zero
-		}
-	default:
-		return zero
-	}
-
-	value, ok := m[f]
+	m, ok := asMap(d)
 	if !ok {
 		return zero
 	}
-	result, ok := value.(K)
+	v, ok := m[f].(K)
 	if !ok {
 		return zero
 	}
-	return result
+	return v
 }
 
+// AnySet 向 map[string]any 写入字段。t 必须是指向该 map 的指针（*map[string]any，或指向 map 的 *any），否则返回 false。
 func AnySet(t, d any, fieldName string) bool {
 	var m map[string]any
-
 	switch v := t.(type) {
 	case *map[string]any:
-		if v == nil {
-			return false
+		if v != nil {
+			m = *v
 		}
-		m = *v
 	case *any:
-		if v == nil {
-			return false
+		if v != nil {
+			m, _ = asMap(*v)
 		}
-		var ok bool
-		m, ok = (*v).(map[string]any)
-		if !ok {
-			return false
-		}
-	case **map[string]any:
-		if v == nil || *v == nil {
-			return false
-		}
-		m = **v
-	case **any:
-		if v == nil || *v == nil {
-			return false
-		}
-		var ok bool
-		m, ok = (**v).(map[string]any)
-		if !ok {
-			return false
-		}
-	default:
-		// 保持旧 API 对“指向非 map 的指针”返回 true 的行为；
-		// 常见 map 路径不会进入这里，因此不再为热路径支付反射开销。
-		rv := reflect.ValueOf(t)
-		if !rv.IsValid() || rv.Kind() != reflect.Pointer || rv.IsNil() {
-			return false
-		}
-		rv = rv.Elem()
-		if rv.IsValid() {
-			rv = reflect.Indirect(rv)
-		}
-		if rv.IsValid() && rv.Kind() == reflect.Map {
-			return false
-		}
-		return true
 	}
-
 	if m == nil {
 		return false
 	}
 	m[fieldName] = d
 	return true
+}
+
+func asMap(v any) (map[string]any, bool) {
+	switch x := v.(type) {
+	case map[string]any:
+		return x, true
+	case *map[string]any:
+		if x != nil {
+			return *x, true
+		}
+	case *any:
+		if x != nil {
+			return asMap(*x)
+		}
+	}
+	return nil, false
 }

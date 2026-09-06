@@ -16,8 +16,16 @@ import (
 	"github.com/xmdhs/clash2singbox/model/singbox"
 )
 
-func TestGetExtTag(t *testing.T) {
-	nodes, err := getExtTag([]byte(`{
+// decodeForTest 解码测试用的 JSON 模板。
+func decodeForTest(t *testing.T, config string) map[string]any {
+	t.Helper()
+	d, err := decodeConfig([]byte(config))
+	require.NoError(t, err)
+	return d
+}
+
+func TestTemplateOutbounds(t *testing.T) {
+	nodes, err := templateOutbounds(decodeForTest(t, `{
   "outbounds":[
     {"type":"vmess","tag":"a"},
     {"type":"direct","tag":"direct"},
@@ -34,73 +42,73 @@ func TestGetExtTag(t *testing.T) {
 	assert.Equal(t, "selector", nodes[1].nodeType)
 }
 
-func TestGetExtTagInvalidJSON(t *testing.T) {
-	_, err := getExtTag([]byte(`{`))
+func TestTemplateOutboundsMissingOutbounds(t *testing.T) {
+	_, err := templateOutbounds(map[string]any{})
 	assert.ErrorIs(t, err, ErrFormat)
 }
 
-func TestGetExtTagMissingOutbounds(t *testing.T) {
-	_, err := getExtTag([]byte(`{}`))
+func TestTemplateOutboundsNotArray(t *testing.T) {
+	_, err := templateOutbounds(map[string]any{"outbounds": "x"})
 	assert.ErrorIs(t, err, ErrFormat)
 }
 
-func TestSingDetourList(t *testing.T) {
+func TestDetourChainSing(t *testing.T) {
 	singMap := map[string]singbox.SingBoxOut{
 		"a": {Tag: "a", Detour: "b"},
 		"b": {Tag: "b", Detour: ""},
 		"c": {Tag: "c", Detour: "a"},
 	}
-	tags, out := singDetourList("c", singMap)
+	tags, out := detourChain("c", singMap, singTagDetour)
 	assert.Equal(t, []string{"c", "a", "b"}, tags)
 	assert.Len(t, out, 3)
 	assert.Equal(t, "b", out[2].Tag)
 
 	// 缺失节点
-	tags, out = singDetourList("nope", singMap)
+	tags, out = detourChain("nope", singMap, singTagDetour)
 	assert.Empty(t, tags)
 	assert.Empty(t, out)
 }
 
-func TestSingDetourListCycle(t *testing.T) {
+func TestDetourChainSingCycle(t *testing.T) {
 	singMap := map[string]singbox.SingBoxOut{
 		"x": {Tag: "x", Detour: "y"},
 		"y": {Tag: "y", Detour: "x"},
 	}
-	tags, _ := singDetourList("x", singMap)
+	tags, _ := detourChain("x", singMap, singTagDetour)
 	assert.Equal(t, []string{"x", "y"}, tags)
 }
 
-func TestAnyDetourList(t *testing.T) {
+func TestDetourChainAny(t *testing.T) {
 	anyMap := map[string]map[string]any{
 		"w1": {"tag": "w1", "detour": "w2"},
 		"w2": {"tag": "w2", "detour": ""},
 	}
-	tags, out := anyDetourList("w1", anyMap)
+	tags, out := detourChain("w1", anyMap, anyTagDetour)
 	assert.Equal(t, []string{"w1", "w2"}, tags)
 	assert.Len(t, out, 2)
 
-	tags, out = anyDetourList("missing", anyMap)
+	tags, out = detourChain("missing", anyMap, anyTagDetour)
 	assert.Empty(t, tags)
 	assert.Empty(t, out)
 }
 
-func TestAnyDetourListCycle(t *testing.T) {
+func TestDetourChainAnyCycle(t *testing.T) {
 	anyMap := map[string]map[string]any{
 		"x": {"tag": "x", "detour": "y"},
 		"y": {"tag": "y", "detour": "x"},
 	}
-	tags, _ := anyDetourList("x", anyMap)
+	tags, _ := detourChain("x", anyMap, anyTagDetour)
 	assert.Equal(t, []string{"x", "y"}, tags)
 }
 
-func TestUrlTestDetourSet(t *testing.T) {
+func TestExpandDetours(t *testing.T) {
 	s := []singbox.SingBoxOut{{Type: "vmess", Tag: "B"}}
 	outs := []map[string]any{
 		{"type": "http", "tag": "wrapper", "server": "example.com", "detour": ""},
 	}
-	config := []byte(`{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"wrapper"}]}`)
+	config := decodeForTest(t, `{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"wrapper"}]}`)
 
-	_, newOuts, extTags := urlTestDetourSet(s, nil, config, outs, nil)
+	_, newOuts, extTags := expandDetours(s, nil, config, outs, nil)
 	require.Len(t, newOuts, 2)
 	assert.Equal(t, "wrapper", newOuts[0]["tag"])
 
@@ -113,12 +121,12 @@ func TestUrlTestDetourSet(t *testing.T) {
 	assert.Equal(t, []string{"proxy"}, extTags[0].Visible)
 }
 
-func TestUrlTestDetourSetNoDetourReturnsInput(t *testing.T) {
+func TestExpandDetoursNoDetourReturnsInput(t *testing.T) {
 	s := []singbox.SingBoxOut{{Type: "vmess", Tag: "B"}}
 	outs := []map[string]any{{"type": "http", "tag": "wrapper"}}
-	config := []byte(`{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"]}]}`)
+	config := decodeForTest(t, `{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"]}]}`)
 
-	newS, newOuts, extTags := urlTestDetourSet(s, nil, config, outs, []string{"ext"})
+	newS, newOuts, extTags := expandDetours(s, nil, config, outs, []string{"ext"})
 	assert.Equal(t, s, newS)
 	assert.Equal(t, outs, newOuts)
 	// 传入的 extTag 被包装为无 Visible 的 TagWithVisible

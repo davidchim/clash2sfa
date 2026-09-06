@@ -12,9 +12,9 @@ import (
 	"github.com/xmdhs/clash2singbox/model/singbox"
 )
 
-// --- urlTestDetourSet 的 sing 链与 any 链全分支 ---
+// --- expandDetours 的 sing 链与 any 链全分支 ---
 
-func TestUrlTestDetourSetSingChain(t *testing.T) {
+func TestExpandDetoursSingChain(t *testing.T) {
 	s := []singbox.SingBoxOut{
 		{Type: "vmess", Tag: "B"},
 		{Type: "vmess", Tag: "hidden", Ignored: true},
@@ -25,9 +25,9 @@ func TestUrlTestDetourSetSingChain(t *testing.T) {
 		{"type": "selector", "tag": "sel"},
 		{"type": "urltest", "tag": "ut"},
 	}
-	config := []byte(`{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"n1"}]}`)
+	config := decodeForTest(t, `{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"n1"}]}`)
 
-	newS, newOuts, extTags := urlTestDetourSet(s, nil, config, outs, nil)
+	newS, newOuts, extTags := expandDetours(s, nil, config, outs, nil)
 	require.Len(t, newS, 6)
 	// 忽略节点不参与，ext 的 selector/urltest 不进入 allTags；链尾与链首都生成
 	tailNode, headNode := newS[4], newS[5]
@@ -44,16 +44,16 @@ func TestUrlTestDetourSetSingChain(t *testing.T) {
 	assert.Equal(t, outs, newOuts)
 }
 
-func TestUrlTestDetourSetAnyChain(t *testing.T) {
+func TestExpandDetoursAnyChain(t *testing.T) {
 	s := []singbox.SingBoxOut{{Type: "vmess", Tag: "B"}}
 	outs := []map[string]any{
 		{"type": "http", "tag": "w1", "detour": "w2"},
 		{"type": "http", "tag": "w2", "detour": ""},
 		{"type": "selector", "tag": "sel"},
 	}
-	config := []byte(`{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"w1"}]}`)
+	config := decodeForTest(t, `{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"w1"}]}`)
 
-	_, newOuts, extTags := urlTestDetourSet(s, nil, config, outs, nil)
+	_, newOuts, extTags := expandDetours(s, nil, config, outs, nil)
 	require.Len(t, newOuts, len(outs)+2)
 	tail := newOuts[len(newOuts)-1]
 	assert.Equal(t, "B - w1 [proxy]", tail["tag"])
@@ -64,7 +64,7 @@ func TestUrlTestDetourSetAnyChain(t *testing.T) {
 	assert.Equal(t, []string{"proxy"}, extTags[1].Visible)
 }
 
-// --- convert2sing / MakeConfig 的分支覆盖 ---
+// --- convert / MakeConfig 的分支覆盖 ---
 
 func TestMakeConfigSubFetchError(t *testing.T) {
 	c := NewConvert(&http.Client{}, newSilentLogger())
@@ -91,14 +91,14 @@ func TestMakeConfigConfigUrlFetchError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestMakeConfigGetExtTagError(t *testing.T) {
+func TestMakeConfigTemplateWithoutOutbounds(t *testing.T) {
 	client := &http.Client{Transport: mapRT{m: map[string][]byte{
 		"https://example.com/sub": []byte(subYAML),
 	}}}
 	c := NewConvert(client, newSilentLogger())
 	arg := model.ConvertArg{
 		Sub:    "https://example.com/sub",
-		Config: []byte(`{}`), // 无 outbounds → getExtTag 报错
+		Config: []byte(`{}`), // 无 outbounds → templateOutbounds 报错
 		Ver:    cmodel.SINGLATEST,
 	}
 	_, err := c.MakeConfig(context.Background(), arg, nil, "sing-box/2.0")
@@ -106,7 +106,7 @@ func TestMakeConfigGetExtTagError(t *testing.T) {
 }
 
 func TestMakeConfigRichTemplate(t *testing.T) {
-	// 模板含外部节点，触发 convert2sing 的 nodes 循环与 lo.Map(outs)
+	// 模板含外部节点与分组
 	client := &http.Client{Transport: mapRT{m: map[string][]byte{
 		"https://example.com/sub": []byte(subYAML),
 	}}}

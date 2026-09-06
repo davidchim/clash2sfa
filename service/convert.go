@@ -6,150 +6,113 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"net/http"
-	"slices"
 
-	"log/slog"
-
+	"github.com/xmdhs/clash2sfa/model"
 	"github.com/xmdhs/clash2singbox/convert"
 	"github.com/xmdhs/clash2singbox/httputils"
-	"github.com/xmdhs/clash2singbox/model"
 	"github.com/xmdhs/clash2singbox/model/singbox"
 )
 
-func convert2sing(cxt context.Context, client *http.Client, config []byte,
-	sub string, include, exclude string, addTag bool, l *slog.Logger, urlTestOut bool, outFields bool, ver model.SingBoxVer) (map[string]any, []TagWithVisible, error) {
-	c, singList, tags, err := httputils.GetAny(cxt, client, sub, addTag)
-	if err != nil {
-		return nil, nil, fmt.Errorf("convert2sing: %w", err)
-	}
-
-	configMap, err := decodeConfig(config)
-	if err != nil {
-		return nil, nil, fmt.Errorf("convert2sing: %w", err)
-	}
-	nodes, err := getExtTagFromMap(configMap)
-	if err != nil {
-		return nil, nil, fmt.Errorf("convert2sing: %w", err)
-	}
-	outs := make([]map[string]any, 0, len(nodes)+len(singList))
-	extTag := make([]string, 0, len(nodes)+len(tags))
-
-	for _, v := range nodes {
-		outs = append(outs, v.node)
-		if v.nodeType != "urltest" && v.nodeType != "selector" {
-			extTag = append(extTag, v.tag)
-		}
-	}
-
-	s, eps, err := convert.Clash2sing(c, ver)
-	if err != nil {
-		l.DebugContext(cxt, err.Error())
-	}
-	outs = append(outs, singList...)
-	extTag = append(extTag, tags...)
-
-	s, outs, extTagWithV := urlTestDetourSetFromMap(s, eps, configMap, outs, extTag)
-
-	extOut := make([]any, len(outs))
-	for i, item := range outs {
-		extOut[i] = item
-	}
-	nb, err := convert.PatchMapFromMap(configMap, s, eps, include, exclude, extOut, extTag, urlTestOut, outFields)
-	if err != nil {
-		return nil, nil, fmt.Errorf("convert2sing: %w", err)
-	}
-	nodeTag := make([]TagWithVisible, 0, len(s)+len(eps)+len(extTagWithV))
-
-	for _, v := range s {
-		if v.Ignored {
-			continue
-		}
-		nodeTag = append(nodeTag, TagWithVisible{
-			Tag:     v.Tag,
-			Visible: v.Visible,
-		})
-	}
-	for _, ep := range eps {
-		if ep == nil || ep.Tag == "" {
-			continue
-		}
-		nodeTag = append(nodeTag, TagWithVisible{
-			Tag: ep.Tag,
-		})
-	}
-	nodeTag = append(nodeTag, extTagWithV...)
-	return nb, nodeTag, nil
-}
-
 var ErrFormat = errors.New("错误的格式")
 
-var notNeedTag = map[string]struct{}{
-	"direct":  {},
-	"block":   {},
-	"dns-out": {},
+// convert 抓取订阅、转换节点并合并进模板。返回打好补丁的配置，以及所有可被分组引用的节点 tag（含可见性），
+// 供 configUrlTestParser 展开模板分组里的 include: / exclude: 指令。
+func (c *Convert) convert(ctx context.Context, arg model.ConvertArg) (map[string]any, []TagWithVisible, error) {
+	clashCfg, singNodes, singTags, err := httputils.GetAny(ctx, c.c, arg.Sub, arg.AddTag)
+	if err != nil {
+		return nil, nil, fmt.Errorf("convert: %w", err)
+	}
+	config, err := decodeConfig(arg.Config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("convert: %w", err)
+	}
+	tplOuts, err := templateOutbounds(config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("convert: %w", err)
+	}
+
+	// 外部节点 = 模板自带的 outbound + 订阅直接给出的 sing-box outbound；分组本身不算节点
+	outs := make([]map[string]any, 0, len(tplOuts)+len(singNodes))
+	extTags := make([]string, 0, len(tplOuts)+len(singTags))
+	for _, o := range tplOuts {
+		outs = append(outs, o.node)
+		if !o.isGroup() {
+			extTags = append(extTags, o.tag)
+		}
+	}
+	outs = append(outs, singNodes...)
+	extTags = append(extTags, singTags...)
+
+	s, eps, err := convert.Clash2sing(clashCfg, arg.Ver)
+	if err != nil {
+		c.l.DebugContext(ctx, err.Error()) // 个别节点转换失败只记日志，不影响其余节点
+	}
+	s, outs, tags := expandDetours(s, eps, config, outs, extTags)
+
+	extOut := make([]any, len(outs))
+	for i, o := range outs {
+		extOut[i] = o
+	}
+	config, err = convert.PatchMapFromMap(config, s, eps, arg.Include, arg.Exclude, extOut, extTags, !arg.DisableUrlTest, arg.OutFields)
+	if err != nil {
+		return nil, nil, fmt.Errorf("convert: %w", err)
+	}
+	return config, nodeTags(s, eps, tags), nil
 }
 
-type extTag struct {
+// decodeConfig 解码 JSON 模板；非法 JSON 或不是对象时返回 ErrFormat。
+func decodeConfig(config []byte) (map[string]any, error) {
+	var d map[string]any
+	if err := json.Unmarshal(config, &d); err != nil {
+		return nil, fmt.Errorf("decodeConfig: %w: %v", ErrFormat, err)
+	}
+	if d == nil {
+		return nil, fmt.Errorf("decodeConfig: %w: 配置必须是 JSON 对象", ErrFormat)
+	}
+	return d, nil
+}
+
+// templateOutbound 是模板里用户自定义的 outbound（节点或分组）。
+type templateOutbound struct {
 	tag      string
 	node     map[string]any
 	nodeType string
 }
 
-func decodeConfig(config []byte) (map[string]any, error) {
-	d := map[string]any{}
-	if err := json.Unmarshal(config, &d); err != nil {
-		return nil, fmt.Errorf("decodeConfig: %w", ErrFormat)
-	}
-	return d, nil
+func (o templateOutbound) isGroup() bool {
+	return o.nodeType == "urltest" || o.nodeType == "selector"
 }
 
-func getExtTag(config []byte) ([]extTag, error) {
-	d, err := decodeConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("getExtTag: %w", err)
-	}
-	return getExtTagFromMap(d)
-}
+// builtinTags 是 PatchMapFromMap 会自动补上的 outbound，模板里的同名项不作为用户节点处理。
+var builtinTags = map[string]bool{"direct": true, "block": true, "dns-out": true}
 
-func getExtTagFromMap(config map[string]any) ([]extTag, error) {
-	rawOutbounds, exists := config["outbounds"]
-	if !exists {
-		return nil, fmt.Errorf("getExtTag: %w", ErrFormat)
+// templateOutbounds 提取模板 outbounds 中除 direct / block / dns-out 之外的全部 outbound。
+func templateOutbounds(config map[string]any) ([]templateOutbound, error) {
+	raw, ok := config["outbounds"]
+	if !ok {
+		return nil, fmt.Errorf("templateOutbounds: 缺少 outbounds: %w", ErrFormat)
 	}
-
-	var outbounds []any
-	switch v := rawOutbounds.(type) {
-	case []any:
-		outbounds = v
-	case map[string]any:
-		// gjson.Array 将非数组对象视为单个元素；保持原有
-		// 行为，将对象作为单个 outbound 处理。
-		outbounds = []any{v}
-	default:
-		outbounds = nil
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("templateOutbounds: outbounds 必须是数组: %w", ErrFormat)
 	}
-
-	nodes := make([]extTag, 0, len(outbounds))
-	for _, raw := range outbounds {
-		m, ok := raw.(map[string]any)
+	outs := make([]templateOutbound, 0, len(list))
+	for _, item := range list {
+		m, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
 		tag, _ := m["tag"].(string)
-		atype, _ := m["type"].(string)
-		if _, ok := notNeedTag[tag]; ok {
+		if builtinTags[tag] {
 			continue
 		}
-		nodes = append(nodes, extTag{
-			tag:      tag,
-			node:     m,
-			nodeType: atype,
-		})
+		typ, _ := m["type"].(string)
+		outs = append(outs, templateOutbound{tag: tag, node: m, nodeType: typ})
 	}
-	return nodes, nil
+	return outs, nil
 }
 
+// TagWithVisible 是一个可被分组引用的节点 tag。Visible 非空时只在列出的分组中可见，"_hide" 表示对所有分组隐藏。
 type TagWithVisible struct {
 	Tag     string
 	Visible []string
@@ -163,273 +126,194 @@ func tagsWithVisible(tags []string) []TagWithVisible {
 	return out
 }
 
-func outboundWithLists(config map[string]any) []map[string]any {
-	raw, ok := config["outbounds"]
-	if !ok {
-		return nil
-	}
-	outbounds, ok := raw.([]any)
-	if !ok {
-		return nil
-	}
-	list := make([]map[string]any, 0, len(outbounds))
-	for _, raw := range outbounds {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if _, ok := m["outbounds"]; ok {
-			list = append(list, m)
-		}
-	}
-	return list
-}
-
-func urlTestDetourSet(s []singbox.SingBoxOut, eps []*singbox.SingBoxEndpoint, config []byte, outs []map[string]any, extTag []string) ([]singbox.SingBoxOut, []map[string]any, []TagWithVisible) {
-	d, err := decodeConfig(config)
-	if err != nil {
-		return s, outs, tagsWithVisible(extTag)
-	}
-	return urlTestDetourSetFromMap(s, eps, d, outs, extTag)
-}
-
-func urlTestDetourSetFromMap(s []singbox.SingBoxOut, eps []*singbox.SingBoxEndpoint, config map[string]any, outs []map[string]any, extTag []string) ([]singbox.SingBoxOut, []map[string]any, []TagWithVisible) {
-	list := outboundWithLists(config)
-	// 快路径：无 detour 时直接返回，避免 per-request Once/Atomic 与建表开销。
-	hasDetour := false
-	for _, value := range list {
-		if detour, _ := value["detour"].(string); detour != "" {
-			hasDetour = true
-			break
-		}
-	}
-	if !hasDetour {
-		return s, outs, tagsWithVisible(extTag)
-	}
-
-	singMap := make(map[string]singbox.SingBoxOut, len(s))
-	for _, item := range s {
-		singMap[item.Tag] = item
-	}
-	anyMap := make(map[string]map[string]any, len(outs))
-	for _, item := range outs {
-		tag, _ := item["tag"].(string)
-		anyMap[tag] = item
-	}
-	allTags := make([]string, 0, len(s)+len(eps)+len(outs))
+// nodeTags 汇总所有可被分组引用的节点：转换出的节点（跳过只作 detour 的 Ignored 节点）、endpoint 与外部节点。
+func nodeTags(s []singbox.SingBoxOut, eps []*singbox.SingBoxEndpoint, ext []TagWithVisible) []TagWithVisible {
+	tags := make([]TagWithVisible, 0, len(s)+len(eps)+len(ext))
 	for _, v := range s {
-		if v.Ignored {
-			continue
+		if !v.Ignored {
+			tags = append(tags, TagWithVisible{Tag: v.Tag, Visible: v.Visible})
 		}
-		allTags = append(allTags, v.Tag)
 	}
 	for _, ep := range eps {
-		if ep == nil || ep.Tag == "" {
-			continue
+		if ep != nil && ep.Tag != "" {
+			tags = append(tags, TagWithVisible{Tag: ep.Tag})
 		}
-		allTags = append(allTags, ep.Tag)
 	}
-	for k, v := range anyMap {
-		t, _ := v["type"].(string)
-		if t == "urltest" || t == "selector" {
-			continue
-		}
-		allTags = append(allTags, k)
-	}
+	return append(tags, ext...)
+}
 
-	// 精确预留：先对每个 detour 算链长与可展开 tag 数，总量一次分配到位，
-	// 避免 cap=0 反复扩容，也避免过度预留的 memclr/GC 开销。
-	type detourPlan struct {
-		tag       string
-		singDList []singbox.SingBoxOut
-		anyDList  []map[string]any
-		notAdd    map[string]struct{}
-		expandN   int
-	}
-	plans := make([]detourPlan, 0, len(list))
-	totalSing := 0
-	totalAny := 0
-	for _, value := range list {
-		detour, _ := value["detour"].(string)
-		tag, _ := value["tag"].(string)
+// detourGroup 是模板里设置了 detour 的分组。
+type detourGroup struct {
+	tag, detour string
+}
+
+// groupsWithDetour 返回模板中带 detour 字段的分组（即含 outbounds 字段的 outbound）。
+func groupsWithDetour(config map[string]any) []detourGroup {
+	list, _ := config["outbounds"].([]any)
+	var groups []detourGroup
+	for _, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, isGroup := m["outbounds"]; !isGroup {
+			continue
+		}
+		detour, _ := m["detour"].(string)
 		if detour == "" {
 			continue
 		}
-		tags, singDList := singDetourList(detour, singMap)
-		notAdd := make(map[string]struct{}, len(tags)+4)
-		for _, v := range tags {
-			notAdd[v] = struct{}{}
-		}
-		tags, anyDList := anyDetourList(detour, anyMap)
-		for _, v := range tags {
-			notAdd[v] = struct{}{}
-		}
-		expandN := 0
-		for _, nowTag := range allTags {
-			if _, ok := notAdd[nowTag]; !ok {
-				expandN++
-			}
-		}
-		plans = append(plans, detourPlan{tag: tag, singDList: singDList, anyDList: anyDList, notAdd: notAdd, expandN: expandN})
-		totalSing += expandN * len(singDList)
-		totalAny += expandN * len(anyDList)
+		tag, _ := m["tag"].(string)
+		groups = append(groups, detourGroup{tag: tag, detour: detour})
 	}
-	newSingOut := make([]singbox.SingBoxOut, 0, totalSing)
-	newAnyOut := make([]map[string]any, 0, totalAny)
-	newExtTag := make([]TagWithVisible, 0, totalAny)
-
-	for _, plan := range plans {
-		tag := plan.tag
-		singDList := plan.singDList
-		anyDList := plan.anyDList
-		notAdd := plan.notAdd
-		for _, nowTag := range allTags {
-			if _, ok := notAdd[nowTag]; ok {
-				continue
-			}
-			prevTag := ""
-			for i, singDetour := range slices.Backward(singDList) {
-
-				if prevTag == "" {
-					singDetour.Detour = nowTag
-				} else {
-					singDetour.Detour = prevTag
-				}
-				if i == 0 {
-					singDetour.Visible = []string{tag}
-				} else {
-					singDetour.Visible = []string{"_hide"}
-				}
-				prevTag = nowTag + " - " + singDetour.Tag + " [" + tag + "]"
-				singDetour.Tag = prevTag
-				newSingOut = append(newSingOut, singDetour)
-			}
-			prevTag = ""
-			for i, a := range slices.Backward(anyDList) {
-				// maps.Clone 内部批量拷贝，比 make+for range 逐个 mapassign 快
-				//（profile：mapassign_faststr 是热点之一）。
-				anyDetour := maps.Clone(a)
-				if prevTag == "" {
-					anyDetour["detour"] = nowTag
-				} else {
-					anyDetour["detour"] = prevTag
-				}
-				anyDetourTag, _ := anyDetour["tag"].(string)
-				prevTag = nowTag + " - " + anyDetourTag + " [" + tag + "]"
-				if i == 0 {
-					newExtTag = append(newExtTag, TagWithVisible{
-						Tag:     prevTag,
-						Visible: []string{tag},
-					})
-				} else {
-					newExtTag = append(newExtTag, TagWithVisible{
-						Tag:     prevTag,
-						Visible: []string{"_hide"},
-					})
-				}
-				anyDetour["tag"] = prevTag
-				newAnyOut = append(newAnyOut, anyDetour)
-			}
-		}
-	}
-
-	return append(s, newSingOut...), append(outs, newAnyOut...), append(tagsWithVisible(extTag), newExtTag...)
+	return groups
 }
 
-func singDetourList(detour string, singMap map[string]singbox.SingBoxOut) ([]string, []singbox.SingBoxOut) {
-	tags := make([]string, 0, 4)
-	singOut := make([]singbox.SingBoxOut, 0, 4)
-	// 链长通常 1~2，用小数组线性判重比 make(map) 便宜。
-	var seen [8]string
-	nseen := 0
-	var overflow map[string]struct{}
+// expandDetours 处理模板里带 detour 的分组（selector / urltest）：
+// 分组的 detour 指向一条出站链（可多级，沿各节点的 detour 字段追踪）。为每个普通节点复制一份该链，
+// 链尾指向这个节点、tag 改为 "节点 - 链节点 [分组]"，让分组可以在"先经 detour 出站、再走某节点"的组合中选择。
+// 复制出的节点通过 Visible 标记只对该分组可见，链的中间节点标记为 _hide。
+func expandDetours(s []singbox.SingBoxOut, eps []*singbox.SingBoxEndpoint, config map[string]any, outs []map[string]any, extTags []string) ([]singbox.SingBoxOut, []map[string]any, []TagWithVisible) {
+	tags := tagsWithVisible(extTags)
+	groups := groupsWithDetour(config)
+	if len(groups) == 0 {
+		return s, outs, tags
+	}
 
-	for {
-		s, ok := singMap[detour]
-		if !ok {
-			break
+	singByTag := make(map[string]singbox.SingBoxOut, len(s))
+	for _, v := range s {
+		singByTag[v.Tag] = v
+	}
+	anyByTag := make(map[string]map[string]any, len(outs))
+	for _, o := range outs {
+		tag, _ := o["tag"].(string)
+		anyByTag[tag] = o
+	}
+	allTags := selectableTags(s, eps, outs)
+
+	for _, g := range groups {
+		singTags, singChain := detourChain(g.detour, singByTag, singTagDetour)
+		anyTags, anyChain := detourChain(g.detour, anyByTag, anyTagDetour)
+		inChain := make(map[string]bool, len(singTags)+len(anyTags))
+		for _, t := range singTags {
+			inChain[t] = true
 		}
-		// 检查循环引用
-		dup := false
-		for i := 0; i < nseen && i < len(seen); i++ {
-			if seen[i] == s.Tag {
-				dup = true
-				break
+		for _, t := range anyTags {
+			inChain[t] = true
+		}
+
+		for _, nodeTag := range allTags {
+			if inChain[nodeTag] {
+				continue // 链上的节点不能再作为自己的出口
 			}
-		}
-		if !dup && overflow != nil {
-			_, dup = overflow[s.Tag]
-		}
-		if dup {
-			break
-		}
-		if nseen < len(seen) {
-			seen[nseen] = s.Tag
-		} else {
-			if overflow == nil {
-				overflow = make(map[string]struct{}, 4)
-				for i := 0; i < len(seen); i++ {
-					overflow[seen[i]] = struct{}{}
-				}
-			}
-			overflow[s.Tag] = struct{}{}
-		}
-		nseen++
-		tags = append(tags, s.Tag)
-		singOut = append(singOut, s)
-		detour = s.Detour
-		if detour == "" {
-			break
+			s = append(s, chainSingCopies(singChain, nodeTag, g.tag)...)
+			copies, copyTags := chainAnyCopies(anyChain, nodeTag, g.tag)
+			outs = append(outs, copies...)
+			tags = append(tags, copyTags...)
 		}
 	}
-	return tags, singOut
+	return s, outs, tags
 }
 
-func anyDetourList(detour string, anyMap map[string]map[string]any) ([]string, []map[string]any) {
-	tags := make([]string, 0, 4)
-	anyOut := make([]map[string]any, 0, 4)
-	var seen [8]string
-	nseen := 0
-	var overflow map[string]struct{}
-
-	for {
-		a, ok := anyMap[detour]
-		if !ok {
-			break
+// selectableTags 返回可作为链尾出口的全部 tag：转换出的节点（跳过 Ignored）、endpoint，以及外部节点（跳过分组）。
+func selectableTags(s []singbox.SingBoxOut, eps []*singbox.SingBoxEndpoint, outs []map[string]any) []string {
+	tags := make([]string, 0, len(s)+len(eps)+len(outs))
+	for _, v := range s {
+		if !v.Ignored {
+			tags = append(tags, v.Tag)
 		}
-		tag, _ := a["tag"].(string)
-		// 检查循环引用
-		dup := false
-		for i := 0; i < nseen && i < len(seen); i++ {
-			if seen[i] == tag {
-				dup = true
-				break
-			}
+	}
+	for _, ep := range eps {
+		if ep != nil && ep.Tag != "" {
+			tags = append(tags, ep.Tag)
 		}
-		if !dup && overflow != nil {
-			_, dup = overflow[tag]
+	}
+	seen := make(map[string]bool, len(outs))
+	for _, o := range outs {
+		typ, _ := o["type"].(string)
+		tag, _ := o["tag"].(string)
+		if typ == "urltest" || typ == "selector" || seen[tag] {
+			continue
 		}
-		if dup {
-			break
-		}
-		if nseen < len(seen) {
-			seen[nseen] = tag
-		} else {
-			if overflow == nil {
-				overflow = make(map[string]struct{}, 4)
-				for i := 0; i < len(seen); i++ {
-					overflow[seen[i]] = struct{}{}
-				}
-			}
-			overflow[tag] = struct{}{}
-		}
-		nseen++
+		seen[tag] = true
 		tags = append(tags, tag)
-		anyOut = append(anyOut, a)
-		detour, _ = a["detour"].(string)
-		if detour == "" {
+	}
+	return tags
+}
+
+func singTagDetour(o singbox.SingBoxOut) (tag, detour string) {
+	return o.Tag, o.Detour
+}
+
+func anyTagDetour(o map[string]any) (tag, detour string) {
+	tag, _ = o["tag"].(string)
+	detour, _ = o["detour"].(string)
+	return tag, detour
+}
+
+// detourChain 从 start 出发沿 detour 字段追踪出站链，返回链上各节点的 tag 与节点本身；遇到未知 tag 或环时停止。
+func detourChain[T any](start string, nodes map[string]T, tagAndDetour func(T) (tag, detour string)) ([]string, []T) {
+	var tags []string
+	var chain []T
+	visited := map[string]bool{}
+	for cur := start; cur != ""; {
+		node, ok := nodes[cur]
+		if !ok {
 			break
 		}
+		tag, next := tagAndDetour(node)
+		if visited[tag] {
+			break
+		}
+		visited[tag] = true
+		tags = append(tags, tag)
+		chain = append(chain, node)
+		cur = next
 	}
-	return tags, anyOut
+	return tags, chain
+}
+
+// chainSingCopies 为节点 nodeTag 复制一条由转换节点组成的出站链：链尾指向 nodeTag，链首在分组 group 中可见，中间节点隐藏。
+func chainSingCopies(chain []singbox.SingBoxOut, nodeTag, group string) []singbox.SingBoxOut {
+	copies := make([]singbox.SingBoxOut, 0, len(chain))
+	detour := nodeTag
+	for i := len(chain) - 1; i >= 0; i-- {
+		c := chain[i]
+		c.Detour = detour
+		c.Tag = chainTag(nodeTag, c.Tag, group)
+		c.Visible = chainVisible(i, group)
+		detour = c.Tag
+		copies = append(copies, c)
+	}
+	return copies
+}
+
+// chainAnyCopies 与 chainSingCopies 相同，但处理 map 形式的外部节点，并一并返回副本的 tag 与可见性。
+func chainAnyCopies(chain []map[string]any, nodeTag, group string) ([]map[string]any, []TagWithVisible) {
+	copies := make([]map[string]any, 0, len(chain))
+	tags := make([]TagWithVisible, 0, len(chain))
+	detour := nodeTag
+	for i := len(chain) - 1; i >= 0; i-- {
+		c := maps.Clone(chain[i])
+		origTag, _ := c["tag"].(string)
+		newTag := chainTag(nodeTag, origTag, group)
+		c["detour"] = detour
+		c["tag"] = newTag
+		tags = append(tags, TagWithVisible{Tag: newTag, Visible: chainVisible(i, group)})
+		detour = newTag
+		copies = append(copies, c)
+	}
+	return copies, tags
+}
+
+func chainTag(nodeTag, linkTag, group string) string {
+	return nodeTag + " - " + linkTag + " [" + group + "]"
+}
+
+// chainVisible 链首（i == 0）只对分组 group 可见，其余中间节点对所有分组隐藏。
+func chainVisible(i int, group string) []string {
+	if i == 0 {
+		return []string{group}
+	}
+	return []string{"_hide"}
 }

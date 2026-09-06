@@ -80,9 +80,9 @@ func TestStructuredLogger(t *testing.T) {
 	require.NotNil(t, l.NewLogEntry(reqTLS))
 }
 
-func TestWarpSlogHandleWithReqID(t *testing.T) {
+func TestReqIDHandlerWithReqID(t *testing.T) {
 	base := slog.NewTextHandler(discard{}, nil)
-	w := &warpSlogHandle{Handler: base}
+	w := &reqIDHandler{Handler: base}
 	ctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")
 	require.NoError(t, w.Handle(ctx, slog.NewRecord(time.Now(), slog.LevelDebug, "msg", 0)))
 	// 无 req id 时也能写入

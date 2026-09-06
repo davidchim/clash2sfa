@@ -28,6 +28,7 @@ var static embed.FS
 //go:embed frontend.html
 var FrontendByte []byte
 
+// html 是首页模板的数据：模块路径与构建版本，用于页面标识与静态资源缓存失效。
 type html struct {
 	Path string
 	Hash string
@@ -36,17 +37,12 @@ type html struct {
 var info html
 
 func init() {
-	buildInfo, ok := debug.ReadBuildInfo()
-	var hash string
-	if ok {
-		hash = vcsRevision(buildInfo.Settings)
-	}
-	info = html{
-		Path: buildInfo.Main.Path,
-		Hash: hash,
-	}
-	if hash == "" {
-		info.Hash = os.Getenv("VERCEL_GIT_COMMIT_SHA")
+	info.Hash = os.Getenv("VERCEL_GIT_COMMIT_SHA")
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		info.Path = bi.Main.Path
+		if rev := vcsRevision(bi.Settings); rev != "" {
+			info.Hash = rev
+		}
 	}
 }
 
@@ -60,11 +56,10 @@ func vcsRevision(settings []debug.BuildSetting) string {
 }
 
 func NewApp(h slog.Handler) http.Handler {
-	client := newClient()
-	logger := newSlog(h)
-	return newMux(client, logger)
+	return newMux(newClient(), newSlog(h))
 }
 
+// newClient 用于抓取订阅。自行校验证书链，以便补全服务器未下发的中间证书。
 func newClient() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = &tls.Config{
@@ -78,10 +73,7 @@ func newClient() *http.Client {
 }
 
 func newSlog(h slog.Handler) *slog.Logger {
-	l := slog.New(&warpSlogHandle{
-		Handler: h,
-	})
-	return l
+	return slog.New(&reqIDHandler{Handler: h})
 }
 
 func newMux(c *http.Client, l *slog.Logger) *chi.Mux {
@@ -90,50 +82,47 @@ func newMux(c *http.Client, l *slog.Logger) *chi.Mux {
 	subH := handle.NewHandle(convert, l, staticFS)
 
 	mux := chi.NewMux()
-
 	mux.Use(middleware.RequestID)
 	mux.Use(middleware.RealIP)
 	mux.Use(newStructuredLogger(l))
 
 	mux.Get("/sub", subH.Sub)
-
 	mux.With(Cache).Mount("/config", http.StripPrefix("/config", http.FileServerFS(staticFS)))
 	mux.With(Cache).Mount("/static", http.StripPrefix("/static", http.FileServerFS(staticFS)))
-
-	bw := &bytes.Buffer{}
-	lo.Must(template.New("index").Delims("[[", "]]").Parse(string(FrontendByte))).ExecuteTemplate(bw, "index", info)
-	mux.With(Cache).HandleFunc("/", handle.Frontend(bw.Bytes()))
-
+	mux.With(Cache).HandleFunc("/", handle.Frontend(renderIndex()))
 	return mux
 }
 
-func newStructuredLogger(Logger *slog.Logger) func(next http.Handler) http.Handler {
-	return middleware.RequestLogger(&StructuredLogger{Logger: Logger})
+// renderIndex 在启动时渲染一次首页；模板用 [[ ]] 作分隔符，避免与页面里 Vue 的 {{ }} 冲突。
+func renderIndex() []byte {
+	tpl := lo.Must(template.New("index").Delims("[[", "]]").Parse(string(FrontendByte)))
+	var buf bytes.Buffer
+	lo.Must0(tpl.Execute(&buf, info))
+	return buf.Bytes()
 }
 
+func newStructuredLogger(logger *slog.Logger) func(next http.Handler) http.Handler {
+	return middleware.RequestLogger(&StructuredLogger{Logger: logger})
+}
+
+// StructuredLogger 把 chi 的请求日志接到 slog。
 type StructuredLogger struct {
 	Logger *slog.Logger
 }
 
 func (l *StructuredLogger) NewLogEntry(r *http.Request) middleware.LogEntry {
-	var logFields []slog.Attr
-	ctx := r.Context()
-
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-
-	logFields = append(logFields,
+	ctx := r.Context()
+	l.Logger.LogAttrs(ctx, slog.LevelDebug, "request started",
 		slog.String("http_method", r.Method),
 		slog.String("remote_addr", r.RemoteAddr),
 		slog.String("user_agent", r.UserAgent()),
-		slog.String("uri", fmt.Sprintf("%s://%s%s", scheme, r.Host, r.RequestURI)))
-
-	l.Logger.LogAttrs(ctx, slog.LevelDebug, "request started", logFields...)
-	entry := StructuredLoggerEntry{Logger: l.Logger, ctx: ctx}
-
-	return &entry
+		slog.String("uri", fmt.Sprintf("%s://%s%s", scheme, r.Host, r.RequestURI)),
+	)
+	return &StructuredLoggerEntry{Logger: l.Logger, ctx: ctx}
 }
 
 type StructuredLoggerEntry struct {
@@ -156,22 +145,22 @@ func (l *StructuredLoggerEntry) Panic(v any, stack []byte) {
 	)
 }
 
-type warpSlogHandle struct {
+// reqIDHandler 给每条日志附上 chi 生成的请求 ID。
+type reqIDHandler struct {
 	slog.Handler
 }
 
-func (w *warpSlogHandle) Handle(ctx context.Context, r slog.Record) error {
-	id := middleware.GetReqID(ctx)
-	if id != "" {
+func (h *reqIDHandler) Handle(ctx context.Context, r slog.Record) error {
+	if id := middleware.GetReqID(ctx); id != "" {
 		r.AddAttrs(slog.String("req_id", id))
 	}
-	return w.Handler.Handle(ctx, r)
+	return h.Handler.Handle(ctx, r)
 }
 
+// Cache 给静态资源加 12 小时的缓存头。
 func Cache(h http.Handler) http.Handler {
-	fn := func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public, max-age=43200, s-maxage=43200")
 		h.ServeHTTP(w, r)
-	}
-	return http.HandlerFunc(fn)
+	})
 }

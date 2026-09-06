@@ -19,14 +19,3 @@ func TestAnyGetAndSetPointerForms(t *testing.T) {
 		t.Fatal("AnySet(*any) did not update the map")
 	}
 }
-
-func TestAnySetPointerToPointerMap(t *testing.T) {
-	m := map[string]any{}
-	pm := &m
-	if !AnySet(&pm, "value", "field") {
-		t.Fatal("AnySet(**map) returned false")
-	}
-	if got := AnyGet[string](m, "field"); got != "value" {
-		t.Fatalf("AnySet(**map) wrote %q, want value", got)
-	}
-}

@@ -9,24 +9,24 @@ import (
 	"github.com/xmdhs/clash2singbox/model/singbox"
 )
 
-func TestGetExtTagFromMap(t *testing.T) {
+func TestTemplateOutboundsSkipsBuiltin(t *testing.T) {
 	config, err := decodeConfig([]byte(`{"outbounds":[{"type":"vmess","tag":"n1"},{"type":"direct","tag":"direct"}]}`))
 	require.NoError(t, err)
 
-	nodes, err := getExtTagFromMap(config)
+	nodes, err := templateOutbounds(config)
 	require.NoError(t, err)
 	require.Len(t, nodes, 1)
 	assert.Equal(t, "n1", nodes[0].tag)
 	assert.Equal(t, "vmess", nodes[0].nodeType)
 }
 
-func TestUrlTestDetourSetFromMap(t *testing.T) {
+func TestExpandDetoursAnyWrapper(t *testing.T) {
 	config, err := decodeConfig([]byte(`{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["B"],"detour":"wrapper"}]}`))
 	require.NoError(t, err)
 
 	s := []singbox.SingBoxOut{{Type: "vmess", Tag: "B"}}
 	outs := []map[string]any{{"type": "http", "tag": "wrapper", "server": "example.com"}}
-	_, newOuts, extTags := urlTestDetourSetFromMap(s, nil, config, outs, nil)
+	_, newOuts, extTags := expandDetours(s, nil, config, outs, nil)
 
 	require.Len(t, newOuts, 2)
 	assert.Equal(t, "B - wrapper [proxy]", newOuts[1]["tag"])

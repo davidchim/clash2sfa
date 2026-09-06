@@ -31,7 +31,7 @@ type failFile struct{}
 
 func (failFile) Read([]byte) (int, error)             { return 0, errors.New("read error") }
 func (failFile) Close() error                         { return nil }
-func (failFile) Stat() (fs.FileInfo, error)           { return nil, nil }
+func (failFile) Stat() (fs.FileInfo, error)           { return nil, errors.New("stat error") }
 func (failFile) ReadDir(n int) ([]fs.DirEntry, error) { return nil, nil }
 
 type rtFunc func(*http.Request) (*http.Response, error)

@@ -46,7 +46,7 @@ func TestMuxRoutes(t *testing.T) {
 
 	// 静态资源
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/static/base64.min.mjs", nil))
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/static/main.mjs", nil))
 	assert.Equal(t, 200, rec.Code)
 	assert.NotEmpty(t, rec.Body.String())
 

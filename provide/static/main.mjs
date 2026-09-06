@@ -1,232 +1,201 @@
-import { createApp, ref, nextTick } from "./vue.esm-browser.prod.mjs";
-import { Base64 } from "./base64.min.mjs";
-
-// Compression Stream API 辅助函数
 async function compressString(str) {
-    const encoder = new TextEncoder();
-    const inputStream = new ReadableStream({
-        start(controller) {
-            controller.enqueue(encoder.encode(str));
-            controller.close();
+    const stream = new ReadableStream({
+        start(c) {
+            c.enqueue(new TextEncoder().encode(str));
+            c.close();
         },
-    });
-
-    const compressedStream = inputStream.pipeThrough(
-        new CompressionStream("deflate"),
-    );
-    const compressedArray = await new Response(compressedStream).arrayBuffer();
-    return new Uint8Array(compressedArray);
+    }).pipeThrough(new CompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 async function decompressString(compressedData) {
-    const inputStream = new ReadableStream({
-        start(controller) {
-            controller.enqueue(compressedData);
-            controller.close();
+    const stream = new ReadableStream({
+        start(c) {
+            c.enqueue(compressedData);
+            c.close();
         },
-    });
-
-    const decompressedStream = inputStream.pipeThrough(
-        new DecompressionStream("deflate"),
-    );
-    const decompressedArray = await new Response(
-        decompressedStream,
-    ).arrayBuffer();
-    const decoder = new TextDecoder();
-    return decoder.decode(decompressedArray);
+    }).pipeThrough(new DecompressionStream("deflate"));
+    return new TextDecoder().decode(await new Response(stream).arrayBuffer());
 }
 
-createApp({
-    setup(props, context) {
-        const sub = ref("");
-        const newsub = ref("");
-        const include = ref("");
-        const exclude = ref("");
-        const config = ref("加载中");
-        const configurl = ref("");
-        const inFetch = ref(false);
-        const inputRef = ref(null);
-        const addTag = ref(false);
-        const disableUrlTest = ref(false);
-        const outFields = ref("");
-        const configType = ref("");
+function decodeBase64Url(value) {
+    return Uint8Array.fromBase64(value, { alphabet: "base64url" });
+}
 
-        let oldConfig = "";
+function encodeBase64Url(value) {
+    return value.toBase64({ alphabet: "base64url", omitPadding: true });
+}
 
-        (async () => {
-            const f = await fetch(
-                "/config/config.json-1.14.0+.template?" + window.version ?? "",
-            );
-            config.value = await f.text();
-            oldConfig = config.value;
-        })();
+const CONFIG_TEMPLATES = {
+    0: { configurl: "config.json.template", outFields: "1" },
+    1: { configurl: "config.json-1.11.0+.template", outFields: "0" },
+    4: { configurl: "config.json-1.12.0+.template", outFields: "0" },
+    5: { configurl: "config.json-1.14.0+.template", outFields: "0" },
+};
 
-        async function saveParameter() {
-            const subUrl = new URL(new URL(location.href).origin);
-            subUrl.pathname = "/sub";
-            const c = config.value != oldConfig ? config.value : "";
-            if (c != "") {
-                const compressed = await compressString(config.value);
-                const base64String = Base64.fromUint8Array(compressed, true);
-                subUrl.searchParams.set("config", base64String);
-            }
-            configurl.value &&
-                subUrl.searchParams.set("configurl", configurl.value);
-            include.value && subUrl.searchParams.set("include", include.value);
-            exclude.value && subUrl.searchParams.set("exclude", exclude.value);
-            addTag.value && subUrl.searchParams.set("addTag", "true");
-            disableUrlTest.value &&
-                subUrl.searchParams.set("disableUrlTest", "true");
-            outFields.value &&
-                subUrl.searchParams.set("outFields", outFields.value);
-            subUrl.searchParams.set("sub", sub.value);
-            return subUrl.toString();
+class Clash2SfaApp extends HTMLElement {
+    oldConfig = "";
+    abortController = null;
+
+    connectedCallback() {
+        if (this.initialized) return;
+        this.initialized = true;
+
+        this.sub = this.querySelector('[data-ref="sub"]');
+        this.include = this.querySelector('[data-ref="include"]');
+        this.exclude = this.querySelector('[data-ref="exclude"]');
+        this.config = this.querySelector('[data-ref="config"]');
+        this.configurl = this.querySelector('[data-ref="config-url"]');
+        this.configType = this.querySelector('[data-ref="config-type"]');
+        this.disableUrlTest = this.querySelector('[data-ref="disable-url-test"]');
+        this.addTag = this.querySelector('[data-ref="add-tag"]');
+        this.outFields = this.querySelector('[data-ref="out-fields"]');
+        this.fetchProgress = this.querySelector('[data-ref="in-fetch"]');
+        this.newSub = this.querySelector('[data-ref="new-sub"]');
+        this.convert = this.querySelector('[data-ref="convert"]');
+
+        this.abortController = new AbortController();
+        const { signal } = this.abortController;
+        this.convert.addEventListener("click", this.handleClick, { signal });
+        this.configType.addEventListener("change", this.onConfigTypeChange, { signal });
+        document.addEventListener("paste", this.handlePaste, { signal });
+
+        this.updateConfigVisibility();
+        this.loadDefaultConfig();
+    }
+
+    disconnectedCallback() {
+        if (!this.initialized) return;
+        this.abortController?.abort();
+        this.abortController = null;
+        this.initialized = false;
+    }
+
+    async loadDefaultConfig() {
+        try {
+            const version = document.querySelector('meta[name="app-version"]')?.content ?? "";
+            const response = await fetch("/config/config.json-1.14.0+.template?" + version);
+            this.config.value = await response.text();
+            this.oldConfig = this.config.value;
+        } catch (error) {
+            this.config.value = "";
+            console.warn(error);
         }
+    }
 
-        function catchSome(f, onfail) {
-            const nf = async (...a) => {
-                try {
-                    return await f(...a);
-                } catch (e) {
-                    if (onfail) {
-                        onfail();
-                    }
-                    console.warn(e);
-                    alert(String(e));
-                }
-            };
-            return nf;
+    updateConfigVisibility() {
+        this.config.hidden = this.configType.value !== "2";
+        this.configurl.hidden = this.configType.value !== "3";
+    }
+
+    setFetching(value) {
+        this.fetchProgress.hidden = !value;
+        this.convert.hidden = value;
+    }
+
+    async saveParameter() {
+        const subUrl = new URL(location.origin);
+        subUrl.pathname = "/sub";
+        const config = this.config.value !== this.oldConfig ? this.config.value : "";
+        if (config !== "") {
+            subUrl.searchParams.set("config", encodeBase64Url(await compressString(config)));
         }
+        if (this.configurl.value) subUrl.searchParams.set("configurl", this.configurl.value);
+        if (this.include.value) subUrl.searchParams.set("include", this.include.value);
+        if (this.exclude.value) subUrl.searchParams.set("exclude", this.exclude.value);
+        if (this.addTag.checked) subUrl.searchParams.set("addTag", "true");
+        if (this.disableUrlTest.checked) subUrl.searchParams.set("disableUrlTest", "true");
+        if (this.outFields.value) subUrl.searchParams.set("outFields", this.outFields.value);
+        subUrl.searchParams.set("sub", this.sub.value.trim());
+        return subUrl.toString();
+    }
 
-        const click = catchSome(
-            async () => {
-                if (sub.value == "") {
-                    return "";
-                }
-                if (inFetch.value) {
-                    return;
-                }
-                newsub.value = "";
-                inFetch.value = true;
-                const subURL = await saveParameter();
-                const f = await fetch(subURL);
-                if (!f.ok) {
-                    const msg = await f.text();
-                    newsub.value = msg;
-                    console.warn(msg);
-                    inFetch.value = false;
-                    alert("错误 " + msg);
-                    return;
-                }
-                inFetch.value = false;
-                newsub.value = subURL;
-                await nextTick();
-                inputRef.value.scrollIntoView({ behavior: "smooth" });
-                inputRef.value.select();
-                document.execCommand("copy", true);
-                const sing = new URL("sing-box://import-remote-profile");
-                sing.searchParams.set("url", subURL);
-                window.location.href = sing.toString();
-            },
-            () => {
-                inFetch.value = false;
-            },
-        );
-
-        document.addEventListener("paste", async (event) => {
-            const items = event.clipboardData && event.clipboardData.items;
-            for (const v of items) {
-                if (v.kind == "file") continue;
-
-                v.getAsString(async (str) => {
-                    try {
-                        const u = new URL(str);
-                        if (u.pathname != "/sub") {
-                            return;
-                        }
-                        if (!confirm("解析粘贴的订阅链接？")) {
-                            return;
-                        }
-                        const c = u.searchParams.get("config");
-                        if (c && c != "") {
-                            const d = await decompressString(
-                                Base64.toUint8Array(c),
-                            );
-                            configType.value = "2";
-                            config.value = d;
-                        }
-                        const cu = u.searchParams.get("configurl");
-                        if (cu && cu != "") {
-                            configurl.value = cu;
-                            config.value = oldConfig;
-                            configType.value = "3";
-                        } else {
-                            configurl.value = "";
-                        }
-                        include.value =
-                            u.searchParams.get("include") || include.value;
-                        exclude.value =
-                            u.searchParams.get("exclude") || exclude.value;
-                        sub.value = u.searchParams.get("sub") || sub.value;
-                        addTag.value = u.searchParams.get("addTag") === "true";
-                        disableUrlTest.value =
-                            u.searchParams.get("disableUrlTest") === "true";
-                        outFields.value =
-                            u.searchParams.get("outFields") || outFields.value;
-                    } catch (error) {
-                        console.log(error);
-                        return;
-                    }
-                });
+    handleClick = async () => {
+        if (this.sub.value.trim() === "" || !this.fetchProgress.hidden) return "";
+        this.newSub.value = "";
+        this.newSub.hidden = true;
+        this.setFetching(true);
+        try {
+            const subURL = await this.saveParameter();
+            const response = await fetch(subURL);
+            if (!response.ok) {
+                const message = await response.text();
+                this.newSub.value = message;
+                this.newSub.hidden = false;
+                console.warn(message);
+                alert("错误 " + message);
+                return;
             }
-        });
-
-        function onChange() {
-            outFields.value = "";
-            if (configType.value != "2") {
-                config.value = "";
+            this.newSub.value = subURL;
+            this.newSub.hidden = false;
+            this.newSub.scrollIntoView({ behavior: "smooth" });
+            this.newSub.select();
+            try {
+                await navigator.clipboard.writeText(subURL);
+            } catch (error) {
+                console.warn(error);
             }
-            if (configType.value != "3") {
-                configurl.value = "";
-            }
-            if (configType.value === "0") {
-                configurl.value = "config.json.template";
-                outFields.value = "1";
-            }
-            if (configType.value === "1") {
-                configurl.value = "config.json-1.11.0+.template";
-                outFields.value = "0";
-            }
-            if (configType.value === "4") {
-                configurl.value = "config.json-1.12.0+.template";
-                outFields.value = "0";
-            }
-            if (configType.value === "5") {
-                configurl.value = "config.json-1.14.0+.template";
-                outFields.value = "0";
-            }
-            if (configType.value === "2") {
-                if (config.value == "") {
-                    config.value = oldConfig;
-                }
-            }
+            const sing = new URL("sing-box://import-remote-profile");
+            sing.searchParams.set("url", subURL);
+            window.location.href = sing.toString();
+        } catch (error) {
+            console.warn(error);
+            alert(String(error));
+        } finally {
+            this.setFetching(false);
         }
+    };
 
-        return {
-            sub,
-            config,
-            include,
-            exclude,
-            newsub,
-            click,
-            configurl,
-            inFetch,
-            inputRef,
-            addTag,
-            disableUrlTest,
-            outFields,
-            configType,
-            onChange,
-        };
-    },
-}).mount("#app");
+    handlePaste = async (event) => {
+        const text = event.clipboardData?.getData("text")?.trim();
+        if (!text) return;
+        let url;
+        try {
+            url = new URL(text);
+        } catch {
+            return;
+        }
+        if (url.pathname !== "/sub") return;
+        if (!confirm("解析粘贴的订阅链接？")) return;
+        try {
+            const config = url.searchParams.get("config");
+            if (config) {
+                this.configType.value = "2";
+                this.config.value = await decompressString(decodeBase64Url(config));
+            }
+            const configurl = url.searchParams.get("configurl");
+            if (configurl) {
+                this.configurl.value = configurl;
+                this.config.value = this.oldConfig;
+                this.configType.value = "3";
+            } else {
+                this.configurl.value = "";
+            }
+            this.include.value = url.searchParams.get("include") || this.include.value;
+            this.exclude.value = url.searchParams.get("exclude") || this.exclude.value;
+            this.sub.value = url.searchParams.get("sub") || this.sub.value;
+            this.addTag.checked = url.searchParams.get("addTag") === "true";
+            this.disableUrlTest.checked = url.searchParams.get("disableUrlTest") === "true";
+            this.outFields.value = url.searchParams.get("outFields") || this.outFields.value;
+            this.updateConfigVisibility();
+        } catch (error) {
+            console.log(error);
+        }
+    };
+
+    onConfigTypeChange = () => {
+        const { value } = this.configType;
+        this.outFields.value = "";
+        if (value !== "2") this.config.value = "";
+        if (value !== "3") this.configurl.value = "";
+        const preset = CONFIG_TEMPLATES[value];
+        if (preset) {
+            this.configurl.value = preset.configurl;
+            this.outFields.value = preset.outFields;
+        }
+        if (value === "2" && this.config.value === "") this.config.value = this.oldConfig;
+        this.updateConfigVisibility();
+    };
+}
+
+customElements.define("clash2sfa-app", Clash2SfaApp);

@@ -93,7 +93,7 @@ func newMux(c *http.Client, l *slog.Logger) *chi.Mux {
 	return mux
 }
 
-// renderIndex 在启动时渲染一次首页；模板用 [[ ]] 作分隔符，避免与页面里 Vue 的 {{ }} 冲突。
+// renderIndex 在启动时渲染一次首页；模板用 [[ ]] 作分隔符，避免与页面内容中的花括号冲突。
 func renderIndex() []byte {
 	tpl := lo.Must(template.New("index").Delims("[[", "]]").Parse(string(FrontendByte)))
 	var buf bytes.Buffer
